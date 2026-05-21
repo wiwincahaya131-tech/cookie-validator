@@ -6,6 +6,7 @@ Netscape TXT, Cookie-Editor, EditThisCookie, Chromium exports, and JSON.
 import re
 import json
 import logging
+import time
 from typing import List, Tuple, Optional, Dict, Any
 from pathlib import Path
 from datetime import datetime
@@ -17,20 +18,6 @@ logger = logging.getLogger(__name__)
 
 class CookieParser:
     """Parse cookies from various formats."""
-    
-    # Netscape format: domain flag path secure expiry name value
-    # Tab-separated with optional #HttpOnly_ prefix
-    NETSCAPE_PATTERN = re.compile(
-        r'^(?:#HttpOnly_)?'  # Optional #HttpOnly_ prefix
-        r'([^\t]+)\t'  # domain
-        r'(TRUE|FALSE)\t'  # flag (domain match)
-        r'([^\t]+)\t'  # path
-        r'(TRUE|FALSE)\t'  # secure
-        r'([^\t]+)\t'  # expiry (unix timestamp)
-        r'([^\t]+)\t'  # name
-        r'(.*)$',  # value (rest of line)
-        re.IGNORECASE
-    )
     
     AUTH_COOKIE_PATTERNS = [
         r'_digitalocean.*session',
@@ -61,70 +48,132 @@ class CookieParser:
             pass
         
         # Check for Netscape format (7+ tab-separated columns)
+        # Count lines that match Netscape structure
         netscape_count = 0
+        data_line_count = 0
+        
         for line in lines:
-            if line.strip().startswith('#') or not line.strip():
+            line_stripped = line.strip()
+            
+            # Skip empty lines and comment-only lines
+            if not line_stripped or (line_stripped.startswith('#') and not line_stripped.startswith('#HttpOnly_')):
                 continue
             
-            # Count tabs - Netscape format has 6-7 tabs
-            tab_count = line.count('\t')
+            data_line_count += 1
+            
+            # Remove #HttpOnly_ prefix for analysis
+            if line_stripped.startswith('#HttpOnly_'):
+                line_stripped = line_stripped[10:]
+            
+            # Count tabs - Netscape format has 6-7 tabs (7+ columns)
+            tab_count = line_stripped.count('\t')
+            
             if tab_count >= 6:
-                netscape_count += 1
+                # Further validate structure
+                parts = line_stripped.split('\t')
+                if len(parts) >= 7:
+                    try:
+                        # Validate key fields
+                        domain = parts[0]
+                        flag = parts[1].upper()
+                        path = parts[2]
+                        secure = parts[3].upper()
+                        expiry = parts[4]
+                        
+                        # Check validity
+                        if (domain and 
+                            flag in ('TRUE', 'FALSE') and 
+                            secure in ('TRUE', 'FALSE') and 
+                            expiry.isdigit()):
+                            netscape_count += 1
+                    except (IndexError, ValueError):
+                        pass
         
-        if netscape_count >= len([l for l in lines if l.strip() and not l.startswith('#')]) * 0.7:
+        # If more than 50% of data lines match Netscape structure
+        if data_line_count > 0 and netscape_count >= data_line_count * 0.5:
+            logger.debug(f"Detected Netscape format ({netscape_count}/{data_line_count} valid)")
             return CookieSource.NETSCAPE_TXT
         
+        logger.debug(f"Format not clearly identified (netscape: {netscape_count}/{data_line_count})")
         return CookieSource.UNKNOWN
     
     @staticmethod
-    def parse_netscape_line(line: str) -> Optional[NormalizedCookie]:
+    def parse_netscape_line(line: str, now: Optional[int] = None) -> Optional[NormalizedCookie]:
         """
         Parse single Netscape format cookie line.
         
         Format: domain flag path secure expiry name value
         Example:
-            .digitalocean.com  TRUE  /  FALSE  1779460867  notice_behavior  implied,us
-            #HttpOnly_cloud.digitalocean.com  FALSE  /  TRUE  1779460867  _digitalocean2_session_v4  ...
+            .digitalocean.com	TRUE	/	FALSE	1779460867	notice_behavior	implied,us
+            #HttpOnly_cloud.digitalocean.com	FALSE	/	TRUE	1779460867	_digitalocean2_session_v4	...
         """
         line = line.strip()
         
-        # Skip comments and empty lines
-        if not line or line.startswith('#Secure_') or (line.startswith('#') and not line.startswith('#HttpOnly_')):
+        if not line:
             return None
         
+        # Skip non-HttpOnly comments
+        if line.startswith('#') and not line.startswith('#HttpOnly_'):
+            return None
+        
+        # Detect and remove #HttpOnly_ prefix
+        http_only = False
+        if line.startswith('#HttpOnly_'):
+            http_only = True
+            line = line[10:]  # Remove #HttpOnly_ prefix
+        
         try:
-            match = CookieParser.NETSCAPE_PATTERN.match(line)
-            if not match:
-                logger.debug(f"Netscape pattern not matched: {line[:80]}")
+            # Split by TAB character
+            parts = line.split('\t')
+            
+            if len(parts) < 7:
+                logger.debug(f"Netscape line has insufficient columns ({len(parts)}/7): {line[:50]}")
                 return None
             
-            domain = match.group(1).strip()
-            # flag = match.group(2)  # TRUE/FALSE for domain match
-            path = match.group(3).strip() or "/"
-            secure = match.group(4).upper() == 'TRUE'
-            expires_str = match.group(5).strip()
-            name = match.group(6).strip()
-            value = match.group(7).strip()
+            domain = parts[0].strip()
+            flag = parts[1].strip().upper()
+            path = parts[2].strip() or "/"
+            secure = parts[3].strip().upper()
+            expires_str = parts[4].strip()
+            name = parts[5].strip()
+            value = '\t'.join(parts[6:]).strip()  # Value might contain tabs
             
-            # Parse expiry
-            expires = None
-            if expires_str and expires_str != '0':
-                try:
-                    expires = int(expires_str)
-                except ValueError:
-                    logger.debug(f"Invalid expiry timestamp: {expires_str}")
+            # Validate structure
+            if not domain or not name:
+                logger.debug(f"Missing domain or name")
+                return None
             
-            # Detect HttpOnly from original line
-            http_only = line.startswith('#HttpOnly_')
+            if flag not in ('TRUE', 'FALSE'):
+                logger.debug(f"Invalid flag: {flag}")
+                return None
+            
+            if secure not in ('TRUE', 'FALSE'):
+                logger.debug(f"Invalid secure flag: {secure}")
+                return None
+            
+            if not expires_str.isdigit():
+                logger.debug(f"Invalid expiry: {expires_str}")
+                return None
+            
+            # Parse expiry timestamp
+            expires = int(expires_str)
+            
+            # Check if cookie is already expired
+            if now is None:
+                now = int(time.time())
+            
+            if expires < now and expires > 0:  # 0 = session cookie
+                logger.debug(f"Cookie expired: {name} (expires: {datetime.fromtimestamp(expires)})")
+                return None
             
             cookie = NormalizedCookie(
                 domain=domain,
                 name=name,
                 value=value,
                 path=path,
-                secure=secure,
+                secure=secure == 'TRUE',
                 httpOnly=http_only,
-                expires=expires,
+                expires=expires if expires > 0 else None,
                 source_format=CookieSource.NETSCAPE_TXT,
                 original_line=line
             )
@@ -133,17 +182,16 @@ class CookieParser:
             return cookie
         
         except Exception as e:
-            logger.warning(f"Error parsing Netscape cookie: {e}")
+            logger.debug(f"Error parsing Netscape cookie line: {e} | Line: {line[:80]}")
             return None
     
     @staticmethod
-    def parse_json_format(content: str) -> List[NormalizedCookie]:
+    def parse_json_format(content: str, now: Optional[int] = None) -> List[NormalizedCookie]:
         """
         Parse JSON cookie export (Chrome/Firefox/EditThisCookie format).
         
         Expected format:
-            [{
-                "domain": ".digitalocean.com",
+            [{\n                "domain": ".digitalocean.com",
                 "name": "notice_behavior",
                 "value": "implied,us",
                 "path": "/",
@@ -154,6 +202,9 @@ class CookieParser:
             }]
         """
         cookies = []
+        
+        if now is None:
+            now = int(time.time())
         
         try:
             data = json.loads(content)
@@ -166,25 +217,38 @@ class CookieParser:
                     continue
                 
                 try:
+                    # Check expiry
+                    expires = item.get('expires')
+                    if isinstance(expires, (int, float)) and expires < now:
+                        logger.debug(f"Cookie expired (JSON): {item.get('name')}")
+                        continue
+                    
+                    domain = (item.get('domain') or '').strip()
+                    name = (item.get('name') or '').strip()
+                    value = (item.get('value') or '').strip()
+                    
+                    if not (domain and name and value):
+                        logger.debug(f"JSON cookie missing fields")
+                        continue
+                    
                     cookie = NormalizedCookie(
-                        domain=item.get('domain', '').strip(),
-                        name=item.get('name', '').strip(),
-                        value=item.get('value', '').strip(),
-                        path=item.get('path', '/').strip() or '/',
+                        domain=domain,
+                        name=name,
+                        value=value,
+                        path=(item.get('path') or '/').strip() or '/',
                         secure=bool(item.get('secure', False)),
                         httpOnly=bool(item.get('httpOnly', False)),
-                        expires=int(item.get('expires')) if item.get('expires') else None,
+                        expires=int(expires) if isinstance(expires, (int, float)) else None,
                         sameSite=item.get('sameSite'),
                         source_format=CookieSource.JSON_EXPORT,
                         original_line=json.dumps(item)
                     )
                     
-                    if cookie.domain and cookie.name:
-                        cookies.append(cookie)
-                        logger.debug(f"Parsed JSON cookie: {cookie.name}@{cookie.domain}")
+                    cookies.append(cookie)
+                    logger.debug(f"Parsed JSON cookie: {name}@{domain}")
                 
                 except Exception as e:
-                    logger.warning(f"Error parsing JSON cookie item: {e}")
+                    logger.debug(f"Error parsing JSON cookie item: {e}")
                     continue
         
         except json.JSONDecodeError as e:
@@ -203,17 +267,24 @@ class CookieParser:
         Returns:
             CookieGroup with parsed cookies
         """
+        now = int(time.time())
         group = CookieGroup(file_path=str(file_path))
         
         try:
-            content = file_path.read_text(encoding='utf-8')
-        except UnicodeDecodeError:
+            # Try UTF-8 first, fallback to latin-1
             try:
-                content = file_path.read_text(encoding='latin-1')
-            except Exception as e:
-                logger.error(f"Cannot read file {file_path}: {e}")
-                group.parse_errors.append(f"File read error: {e}")
-                return group
+                content = file_path.read_text(encoding='utf-8')
+            except UnicodeDecodeError:
+                try:
+                    content = file_path.read_text(encoding='latin-1')
+                except Exception as e:
+                    logger.error(f"Cannot read file {file_path}: {e}")
+                    group.parse_errors.append(f"File read error: {e}")
+                    return group
+        except Exception as e:
+            logger.error(f"Cannot read file {file_path}: {e}")
+            group.parse_errors.append(f"File read error: {e}")
+            return group
         
         # Detect format
         format_type = cls.detect_format(content)
@@ -221,18 +292,19 @@ class CookieParser:
         logger.info(f"Detected format for {file_path.name}: {format_type.value}")
         
         if format_type == CookieSource.JSON_EXPORT:
-            group.cookies = cls.parse_json_format(content)
+            group.cookies = cls.parse_json_format(content, now)
         
         elif format_type == CookieSource.NETSCAPE_TXT:
             for line in content.split('\n'):
-                cookie = cls.parse_netscape_line(line)
+                cookie = cls.parse_netscape_line(line, now)
                 if cookie:
                     group.cookies.append(cookie)
         
         else:
+            # Unknown format - try Netscape as fallback
             logger.warning(f"Unknown format for {file_path.name}, attempting Netscape parse")
             for line in content.split('\n'):
-                cookie = cls.parse_netscape_line(line)
+                cookie = cls.parse_netscape_line(line, now)
                 if cookie:
                     group.cookies.append(cookie)
         
@@ -240,7 +312,8 @@ class CookieParser:
         group.provider = cls.detect_provider(group.cookies)
         group.root_domain = cls.extract_root_domain(group.cookies)
         
-        logger.info(f"Parsed {len(group.cookies)} cookies from {file_path.name} (provider: {group.provider.value})")
+        logger.info(f"Parsed {len(group.cookies)} cookies from {file_path.name} "
+                   f"(provider: {group.provider.value}, format: {format_type.value})")
         
         return group
     
@@ -257,13 +330,15 @@ class CookieParser:
         """
         domains = {c.domain.lower() for c in cookies}
         
-        digitalocean_domains = {
+        # DigitalOcean indicators
+        do_indicators = {
             'digitalocean.com', 'cloud.digitalocean.com',
             '.digitalocean.com', '.cloud.digitalocean.com'
         }
         
-        if any(d in domains or d.endswith('.digitalocean.com') for d in domains):
-            return Provider.DIGITALOCEAN
+        for domain in domains:
+            if any(ind in domain for ind in do_indicators):
+                return Provider.DIGITALOCEAN
         
         return Provider.UNKNOWN
     
